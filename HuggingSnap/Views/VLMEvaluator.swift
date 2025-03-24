@@ -109,7 +109,7 @@ class VLMEvaluator {
 
                 let modelContainer = try await VLMModelFactory.shared.loadContainer(hub: hubApi,
                     configuration: modelConfiguration
-                ) { [modelConfiguration] progress in
+                ) { progress in
                     Task { @MainActor in
                         self.modelInfo =
                             "Downloading model: \(Int(progress.fractionCompleted * 100))%"

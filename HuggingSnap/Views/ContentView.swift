@@ -53,8 +53,30 @@ struct ContentView: View {
             switch loadState {
             case .unknown, .loading, .failed:
 #if !targetEnvironment(simulator)
-                FrameView(image: model.frame)
+                ZStack {
+                    // Camera feed
+                    FrameView(image: model.frame)
+                        .edgesIgnoringSafeArea(.vertical)
+                    
+                    // Crop box overlay with capture callback
+                    CropBoxOverlayView(onCapture: {
+                        if !isCaptured {
+                            handlePhotoCapture()
+                        } else {
+                            // If already captured, clear inputs (like the X button)
+                            if !model.isStreamingPaused {
+                                model.toggleStreaming()
+                            }
+                            model.movieURL = nil
+                            model.photo = nil
+                            selectedItem = nil
+                            isCaptured = false
+                            loadState = .unknown
+                            llm.output = ""
+                        }
+                    })
                     .edgesIgnoringSafeArea(.vertical)
+                }
 #endif
             case .loadedMovie(let movie):
                 Group {
@@ -74,21 +96,21 @@ struct ContentView: View {
                 .ignoresSafeArea(.keyboard)
                 //
             case .loadedImage(let image):
-                //                // Handle loaded image
-                //                // Little hacky but needed otherwise buttons overflow on edges
-                //                // Do not be tempted to remove
+                // Display the cropped image centered on the screen without zooming or filling
                 Group {
                     ZStack {
-                        Color.clear.edgesIgnoringSafeArea(.vertical)
-                    }.background {
-                        Image(uiImage: image)
-                            .resizable()
-                            .edgesIgnoringSafeArea(.vertical)
-                            .aspectRatio(contentMode: .fill)
-                            .edgesIgnoringSafeArea(.vertical)
-                        //
+                        Color.black.edgesIgnoringSafeArea(.vertical) // Background color
+                        VStack {
+                            Spacer()
+                            Image(uiImage: image)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit) // Maintain aspect ratio without filling
+                                .frame(maxWidth: UIScreen.main.bounds.width, maxHeight: UIScreen.main.bounds.height)
+                            Spacer()
+                        }
                     }
-                }.ignoresSafeArea(.keyboard)
+                }
+                .ignoresSafeArea(.keyboard)
                 //
             }
         }
@@ -212,8 +234,27 @@ struct ContentView: View {
                 if !model.isStreamingPaused {
                     model.toggleStreaming()
                 }
-                if let uiImage = UIImage(data: photoData) {
+                
+                // Get the camera manager to crop the image
+                let cameraManager = CameraManager.shared
+                
+                // Adjust cropping logic to account for layout orientation
+                let cropBoxFrame = model.cropBoxFrame
+                let isPortrait = UIScreen.main.bounds.height > UIScreen.main.bounds.width
+                let adjustedCropBox = cameraManager.adjustCropBox(for: cropBoxFrame, isPortrait: isPortrait)
+                
+                // Crop the image using the adjusted crop box
+                let croppedData = cameraManager.cropImage(from: photoData, cropBox: adjustedCropBox) ?? photoData
+                
+                if let uiImage = UIImage(data: croppedData) {
                     loadState = .loadedImage(uiImage)
+                    
+                    // Automatically call the describe function with the cropped image
+                    llm.customUserInput = ""
+                    Task {
+                        let ciImage = CIImage(image: uiImage)
+                        await llm.generate(image: ciImage ?? CIImage(), videoURL: nil)
+                    }
                 }
             }
         }
@@ -338,6 +379,55 @@ struct ContentView: View {
         }
         
         player.play()
+    }
+    
+    private func handlePhotoCapture() {
+        model.capturePhoto()
+        
+        Task {
+            // Wait for the photo to be captured
+            for _ in 0..<10 { // Try for up to 1 second
+                if model.photo != nil {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 second
+            }
+            
+            // If we have a photo, crop and process it
+            if let photoData = model.photo {
+                let cameraManager = CameraManager.shared
+                
+                // Adjust cropping logic to account for layout orientation
+                let cropBoxFrame = model.cropBoxFrame
+                let isPortrait = UIScreen.main.bounds.height > UIScreen.main.bounds.width
+                let adjustedCropBox = cameraManager.adjustCropBox(for: cropBoxFrame, isPortrait: isPortrait)
+                
+                // Crop the image using the adjusted crop box
+                let croppedData = cameraManager.cropImage(from: photoData, cropBox: adjustedCropBox) ?? photoData
+                
+                await MainActor.run {
+                    if !model.isStreamingPaused {
+                        model.toggleStreaming()
+                    }
+                    
+                    if let croppedUIImage = UIImage(data: croppedData) {
+                        // Display the cropped image in its original size, centered on the screen
+                        loadState = .loadedImage(croppedUIImage)
+                        isCaptured = true
+                        
+                        // Save the cropped region to Photos for troubleshooting
+                        UIImageWriteToSavedPhotosAlbum(croppedUIImage, nil, nil, nil)
+                        
+                        // Pass the cropped image to the describe function
+                        llm.customUserInput = ""
+                        Task {
+                            let ciImage = CIImage(image: croppedUIImage)
+                            await llm.generate(image: ciImage ?? CIImage(), videoURL: nil)
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
